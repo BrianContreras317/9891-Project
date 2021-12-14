@@ -1,0 +1,292 @@
+---
+title: "9891-Final-Project"
+output: html_notebook
+---
+Brian Contreras
+Troy Whittemore
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = FALSE, message = FALSE,fig.width=8, fig.height=5)
+```
+
+```{r prep}
+# rm(list = ls())    
+library(tidyverse)
+library(glmnet)
+library(randomForest)
+require(pROC)
+```
+
+```{r functions}
+AUC_log <- function(log.model, train_type = 'Testing'){
+  beta0.hat <- log.model$a0
+  beta.hat <- as.vector(log.model$beta)
+  if (train_type == 'Training') {
+    d <- (X.train %*% beta.hat +  beta0.hat)
+    y <- y.train
+  } else{
+    d <- (X.test %*% beta.hat +  beta0.hat)
+    y <- y.test
+  }
+  prob.train <- exp(d)/(1 + exp(d))
+  thrs <- seq(0,1,.01)
+  ROC.train <- tibble(FPR = 1:101, TPR = 1:101, data_type = train_type)
+  for (i in 1:101){
+    y.hat.train <- ifelse(prob.train > thrs[i], 1, 0) #table(y.hat.train, y.train)
+    FP.train <- sum(y[y.hat.train==1] == 0) # false positives
+    TP.train <- sum(y.hat.train[y==1] == 1) # true positives
+    P.train <- sum(y==1) # total positives in the data
+    N.train <- sum(y==0) # total negatives in the data
+    ROC.train$FPR[i] <- FP.train/N.train # false positive rate
+    ROC.train$TPR[i] <- TP.train/P.train # true positive rate
+  }
+  AUC.train<- sum((ROC.train$TPR[1:100]+ROC.train$TPR[2:101]) * 0.5 * abs(diff(ROC.train$FPR)))
+  return(AUC.train)
+}
+AUC_RF <- function(model.rf){
+  roc.test <- roc(y.train2, model.rf$test$votes[,2])
+  roc.train <- roc(y.test2, model.rf$votes[,2])
+  train.auc <- auc(model.train)
+  test.auc <- auc(model.test)
+  return(c(train.auc, test.auc))
+}
+```
+
+```{r data_import}
+df <- tibble(read.csv(file.choose(), header=TRUE))
+labels <- ifelse(df$readmitted == "NO", 0, 1)
+df$readmitted <- as.integer(labels)
+# lapply(df,function(x) { length(which(x == '?'))})   # it was 0
+fac_cols <- c('race', 'gender', "age", "diag_1", "diag_2", "diag_3", "max_glu_serum", "A1Cresult", "metformin",
+              "repaglinide", "nateglinide", "chlorpropamide", "glimepiride", "acetohexamide", "glipizide",
+              "glyburide", "tolbutamide", "pioglitazone", "rosiglitazone", "acarbose", "miglitol", "troglitazone",
+              "tolazamide", "examide", "citoglipton", "insulin", "glyburide.metformin", "glipizide.metformin",
+              "glimepiride.pioglitazone","metformin.rosiglitazone", "metformin.pioglitazone", "change", "diabetesMed")
+df[fac_cols] <- lapply(df[fac_cols], factor)
+df <- df %>% select(-medical_specialty, -payer_code, - weight, -encounter_id, -patient_nbr)
+# removing the nulls/unknown values
+# for id columns,  IDs_mapping.csv says they are either null, missing, not available, etc
+df <- df[!(df$race == '?' | df$diag_1 == "?"| df$diag_2 == "?"| df$diag_3 == "?" | df$gender == "Unknown/Invalid" |
+           df$admission_type_id == '6' | df$admission_type_id == "5" | df$discharge_disposition_id == "18" |
+             df$discharge_disposition_id == "26" | df$admission_source_id == "9" | df$admission_source_id == "15" |
+             df$admission_source_id == "17" | df$admission_source_id == "21"),]
+```
+
+```{r}
+n.P <- sum(df$readmitted)
+n.P
+n.N <- 83745 - n.P
+n.N
+n.N/n.P*7
+
+```
+
+```{r first_sample}
+set.seed(1)
+sample_size <- round(nrow(df)*.9)
+index <- sample(seq_len(nrow(df)), size = sample_size)
+train <- df[index, ]
+test <- df[-index, ]
+X.train <- train %>% select(-readmitted)
+X.train <- data.matrix(X.train)
+y.train <- data.matrix(train %>% select(readmitted))
+X.test <- test %>% select(-readmitted)
+X.test <- data.matrix(X.test)
+y.test <- data.matrix(test %>% select(readmitted))
+n.P <- sum(y.train)
+n.N <- sample_size - n.P
+ww <- rep(1,sample_size)
+ww[y.train==1] <- n.N/n.P
+dim <- dim(df)
+
+empty_data <- rep(0, 50)
+AUC_records <- tibble(rid.train = empty_data,las.train = empty_data,eln.train = empty_data,
+                      rf.train = empty_data,rid.test = empty_data,las.test = empty_data,
+                      eln.test = empty_data,rf.test = empty_data)
+```
+
+```{r lasso}
+library(tictoc)
+tic('Lasso CV Creation')
+system.time(cv.lasso<-cv.glmnet(X.train,y.train,weights=ww,family="binomial",alpha = 1, type.measure="auc"))
+lasso1 <- glmnet(X.train, y.train, weights = ww, lambda = cv.lasso$lambda.min,family = "binomial", alpha = 1)
+AUC_records$las.train[1] <- AUC_log(lasso1, "Training")
+AUC_records$las.test[1] <- AUC_log(lasso1, "Testing")
+q <- toc()
+plot(cv.lasso, main = 'Lasso', sub = paste ('Seconds to compute: ',q$toc-q$tic))
+```
+
+```{r elnet}
+tic('Lasso CV Creation')
+system.time(cv.elnet<-cv.glmnet(X.train,y.train,weights=ww,family="binomial",alpha=0.5, type.measure="auc"))
+elnet1 <- glmnet(X.train,y.train,weights = ww,lambda = cv.elnet$lambda.min, family = "binomial", alpha = 0.5)
+AUC_records$eln.train[1] <- AUC_log(elnet1, "Training")
+AUC_records$eln.test[1] <- AUC_log(elnet1, "Testing")
+q <- toc()
+plot(cv.lasso, main = 'Lasso', sub = paste ('Seconds to compute: ',q$toc-q$tic))
+```
+
+```{r ridge}
+tic('Ridge CV Creation')
+system.time(cv.ridge<-cv.glmnet(X.train,y.train,weights=ww,family="binomial",alpha = 0, type.measure="auc"))
+ridge1 <- glmnet(X.train,y.train,weights = ww, lambda = cv.ridge$lambda.min, family = "binomial", alpha = 0)
+AUC_records$rid.train[1] <- AUC_log(ridge1, "Training")
+AUC_records$rid.test[1] <- AUC_log(ridge1, "Testing")
+q <- toc()
+plot(cv.lasso, main = 'Lasso', sub = paste ('Seconds to compute: ',q$toc-q$tic))
+```
+
+```{r randomForest}
+y.train2 <- as.factor(y.train)
+y.test2 <- as.factor(y.test)
+system.time(rf1 <- randomForest(x=X.train, y=y.train2,mtry=7, importance=T, xtest = X.test, ytest = y.test2))
+
+importance(rf1)
+
+rf.roc<-roc(y.train2,rf1$votes[,2])
+rf.roc2<-roc(y.test2,rf1$test$votes[,2])
+# plot(rf.roc)
+AUC_records$rf.train[1] <- auc(rf.roc)
+AUC_records$rf.test[1] <- auc(rf.roc2)
+```
+
+
+```{r training all my models}
+for (i in 2:50) {
+  # fix data
+  set.seed(i)
+  sample_size <- round(nrow(df)*.9)
+  index <- sample(seq_len(nrow(df)), size = sample_size)
+  train <- df[index, ]
+  test <- df[-index, ]
+  X.train <- train %>% select(-readmitted)
+  X.train <- data.matrix(X.train)
+  y.train <- data.matrix(train %>% select(readmitted))
+  X.test <- test %>% select(-readmitted)
+  X.test <- data.matrix(X.test)
+  y.test <- data.matrix(test %>% select(readmitted))
+  n.P <- sum(y.train)
+  n.N <- sample_size - n.P
+  ww <- rep(1,sample_size)
+  ww[y.train==1] <- n.N/n.P
+  dim <- dim(df)
+  
+  # # Logistic Regression
+   cv.ridge<-cv.glmnet(X.train,y.train,weights=ww,family="binomial",alpha = 0, type.measure="auc")
+   ridge <- glmnet(X.train,y.train,weights = ww, lambda = cv.ridge$lambda.min, family = "binomial", alpha = 0)
+   AUC_records$rid.train[i] <- AUC_log(ridge, "Training")
+   AUC_records$rid.test[i] <- AUC_log(ridge, "Testing")
+   cv.elnet<-cv.glmnet(X.train,y.train,weights=ww,family="binomial",alpha=0.5, type.measure="auc")
+   elnet <- glmnet(X.train,y.train,weights = ww,lambda = cv.elnet$lambda.min, family = "binomial", alpha = 0.5)
+   AUC_records$eln.train[i] <- AUC_log(elnet, "Training")
+   AUC_records$eln.test[i] <- AUC_log(elnet, "Testing")
+   cv.lasso<-cv.glmnet(X.train,y.train,weights=ww,family="binomial",alpha = 1, type.measure="auc")
+   lasso <- glmnet(X.train, y.train, weights = ww, lambda = cv.lasso$lambda.min,family = "binomial", alpha = 1)
+   AUC_records$las.train[i] <- AUC_log(lasso, "Training")
+   AUC_records$las.test[i] <- AUC_log(lasso, "Testing")
+  
+  # Random Forest
+  #y.train2 <- as.factor(y.train)
+  #y.test2 <- as.factor(y.test)
+  #rf <- randomForest(x=X.train, y=y.train2,mtry=7, importance=T, xtest = X.test, ytest = y.test2)
+
+  #rf.roc.train<-roc(y.train2,rf$votes[,2])
+  #rf.roc.test<-roc(y.test2,rf$test$votes[,2])
+  #AUC_records$rf.train[i] <- auc(rf.roc.train)
+  #AUC_records$rf.test[i] <- auc(rf.roc.test)
+}
+```
+
+```{r 3b}
+AUC_test = data.frame(AUC_records$rid.test, AUC_records$las.test,     AUC_records$eln.test, AUC_records$rf.test)
+AUC_train = data.frame(AUC_records$rid.train, AUC_records$las.train,    AUC_records$eln.train, AUC_records$rf.train)
+
+boxplot(AUC_train, names=c("Ridge","Lasso", "Elastic Net", "Random Forest"), main="Train AUC", xlab="Method", ylab="AUC",ylim=c(.645, .705))
+boxplot(AUC_test, names=c("Ridge","Lasso", "Elastic Net", "Random Forest"), main="Test AUC", xlab="Method", ylab="AUC",ylim=c(.645, .705))
+```
+
+```{r 3c}
+#3c ridge
+plot(cv.ridge, main="Ridge")
+
+ridge_time = system.time(plot(cv.ridge, main="Ridge"))
+
+#3c elastic net
+plot(cv.elnet, main="Elastic Net")
+
+elnet_time = system.time(plot(cv.elnet, main="Elastic Net"))
+
+#3c lasso
+plot(cv.lasso, main="Lasso")
+
+lasso_time = system.time(plot(cv.lasso, main="Lasso"))
+cv.lasso$lambda.min
+```
+
+#3d
+#see above for time
+```{r}
+median(AUC_records$rid.test)
+median(AUC_records$las.test)
+median(AUC_records$eln.test)
+median(AUC_records$rf.test)
+```
+
+```{r importance}
+beta.las = as.matrix(predict(lasso1, type = 'coefficients'))[-1]
+beta.els = as.matrix(predict(elnet1, type = 'coefficients'))[-1]
+beta.rid = as.matrix(predict(ridge1, type = 'coefficients'))[-1]
+beta.rf <- as.matrix(rf1$importance[,3])
+
+bar_label <- tibble('Coefficient' = colnames(X.train), 'group' = 1:44)
+# This technically breaks the block, but it will still compile correctly
+for (i in 1:236){
+  if (grepl('race',bar_label$Coefficient[i]) |
+      grepl('gender',bar_label$Coefficient[i]) |
+      grepl('age',bar_label$Coefficient[i]) |
+      grepl('change',bar_label$Coefficient[i]) |
+      grepl('diabetesMed',bar_label$Coefficient[i])) {
+    bar_label$group[i] = 'Person_info'}
+  else if (grepl('admission_type_id',bar_label$Coefficient[i]) |
+           grepl('discharge_disposition_id',bar_label$Coefficient[i]) |
+           grepl('admission_source_id',bar_label$Coefficient[i])){
+    bar_label$group[i] = 'Admission_info'}
+  else if (grepl('time_in_hospital',bar_label$Coefficient[i]) |
+           grepl('num_lab_procedures',bar_label$Coefficient[i]) |
+           grepl('num_medications',bar_label$Coefficient[i]) |
+           grepl('number_outpatient',bar_label$Coefficient[i]) |
+           grepl('number_emergency',bar_label$Coefficient[i]) |
+           grepl('num_procedures',bar_label$Coefficient[i]) |
+           grepl('number_inpatient',bar_label$Coefficient[i])){
+    bar_label$group[i] = 'Hospital_info'}
+  else if (grepl('diag_1',bar_label$Coefficient[i]) |
+           grepl('diag_2',bar_label$Coefficient[i]) |
+           grepl('diag_3',bar_label$Coefficient[i])){
+    bar_label$group[i] = 'Diagnosis_info'}
+  else {bar_label$group[i] = 'Medicine_used'}
+}
+```
+
+
+```{r importance_2}
+predictors <- tibble('Predictors' = colnames(X.test), 'Lasso' = beta.las,
+                     'Elastic' = beta.els, 'Ridge' = beta.rid,
+                     'RandomForest' = beta.rf,'Group' = bar_label$group)
+ggplot(data = predictors, aes(x = reorder(Predictors, -Elastic), y = Elastic, fill = Group)) +
+  geom_bar(stat='identity') + ggtitle('Elastic Coefficients') + xlab("Predictors") +
+  theme(axis.text.x = element_text(angle=90, size=4, color = 'black'),
+        legend.text = element_text(size = 6))
+ggplot(data = predictors, aes(x = reorder(Predictors, -Elastic), y = Lasso, fill = Group)) +
+  geom_bar(stat='identity') + ggtitle('Lasso Coefficients') + xlab("Predictors") +
+  theme(axis.text.x = element_text(angle=90, size=4, color = 'black'),
+        legend.text = element_text(size = 6))
+ggplot(data = predictors, aes(x = reorder(Predictors, -Elastic), y = Ridge, fill = Group)) +
+  geom_bar(stat='identity')  + ggtitle('Ridge Coefficients') + xlab("Predictors") +
+  theme(axis.text.x = element_text(angle=90, size=4, color = 'black'),
+        legend.text = element_text(size = 6))
+ggplot(data = predictors, aes(x = reorder(Predictors, -Elastic), y = RandomForest, fill = Group)) +
+  geom_bar(stat='identity') + ggtitle('Random Forest Coefficients') + xlab("Predictors") +
+  theme(axis.text.x = element_text(angle=90, size=4, color = 'black'),
+        legend.text = element_text(size = 6))
+```
+
